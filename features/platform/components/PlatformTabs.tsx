@@ -130,7 +130,7 @@ export function PlatformTabs({
               onClick={() => handlePlatformChange(platform.id)}
             >
               <div className="text-sm font-medium leading-5 whitespace-nowrap flex items-center justify-center h-full gap-2">
-                <span className="uppercase tracking-wide">{platform.name}</span>
+                <span className="capitalize tracking-wide">{platform.name}</span>
                 <span className="rounded-sm bg-background border shadow-xs px-1.5 py-0 text-[10px] leading-[14px] font-medium text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400 inline-flex items-center h-[18px]">
                   {platform.count || 0}
                 </span>

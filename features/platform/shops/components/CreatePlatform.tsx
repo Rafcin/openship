@@ -16,6 +16,7 @@ import {
 } from "@/components/ui/dialog";
 import { Fields } from "@/features/dashboard/components/Fields";
 import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Checkbox } from "@/components/ui/checkbox";
 import { AlertTriangle } from "lucide-react";
 import {
   Select,
@@ -32,7 +33,43 @@ import { Label } from "@/components/ui/label";
 const shopAdapters = {
   shopify: "shopify",
   openfront: "openfront",
+  salesforce: "salesforce",
   demo: "demo",
+};
+
+const platformHelpText: Record<string, {
+  title: string;
+  toggles: Array<{ section: string; items: Array<{ label: string; details?: string[] }> }>;
+  scopes: string[];
+  reminders: string[];
+}> = {
+  salesforce: {
+    title: "Salesforce setup checklist",
+    toggles: [
+      {
+        section: "Flow Enablement",
+        items: [
+          { label: "Enable Authorization Code and Credentials Flow" },
+        ],
+      },
+      {
+        section: "Security",
+        items: [
+          { label: "Require secret for Web Server Flow" },
+          { label: "Require secret for Refresh Token Flow" },
+          { label: "Require Proof Key for Code Exchange (PKCE) extension for Supported Authorization Flows" },
+        ],
+      },
+    ],
+    scopes: [
+      "Manage user data via APIs (api)",
+      "Perform requests at any time (refresh_token, offline_access)",
+      "Access unique user identifiers (openid)",
+    ],
+    reminders: [
+      "Set the connected app callback URL to the value shown on this form before starting OAuth.",
+    ],
+  },
 };
 
 export function getFilteredProps(props: any, modifications: any[], defaultCollapse?: boolean) {
@@ -236,7 +273,7 @@ export function CreatePlatform({ trigger }: { trigger: React.ReactNode }) {
     <Dialog open={isDialogOpen} onOpenChange={setIsDialogOpen}>
       <DialogTrigger asChild>{trigger}</DialogTrigger>
 
-      <DialogContent>
+    <DialogContent className="max-h-[85vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle>Create Shop Platform</DialogTitle>
           <DialogDescription>
@@ -275,6 +312,66 @@ export function CreatePlatform({ trigger }: { trigger: React.ReactNode }) {
             </SelectContent>
           </Select>
         </div>
+
+        {selectedPlatform && platformHelpText[selectedPlatform] && (
+          <Alert className="mt-4">
+            <AlertDescription>
+              <div className="space-y-4 text-sm">
+                <div className="font-medium">
+                  {platformHelpText[selectedPlatform].title}
+                </div>
+
+                {platformHelpText[selectedPlatform].toggles.map((section) => (
+                  <div key={section.section} className="space-y-2">
+                    <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                      {section.section}
+                    </div>
+                    <div className="space-y-2">
+                      {section.items.map((item) => (
+                        <div key={item.label} className="space-y-1">
+                          <label className="flex items-center gap-2 text-muted-foreground">
+                            <Checkbox
+                              checked
+                              disabled
+                              className="h-4 w-4 border-green-600 data-[state=checked]:bg-green-600 data-[state=checked]:border-green-600"
+                            />
+                            <span>{item.label}</span>
+                          </label>
+                          {item.details && (
+                            <ul className="list-disc pl-6 text-xs text-muted-foreground space-y-1">
+                              {item.details.map((detail) => (
+                                <li key={detail}>{detail}</li>
+                              ))}
+                            </ul>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+
+                <div className="space-y-2">
+                  <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                    OAuth scopes
+                  </div>
+                  <ul className="list-disc space-y-1 pl-5 text-muted-foreground">
+                    {platformHelpText[selectedPlatform].scopes.map((scope) => (
+                      <li key={scope}>
+                        <code>{scope}</code>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+
+                <div className="space-y-1 text-muted-foreground">
+                  {platformHelpText[selectedPlatform].reminders.map((note) => (
+                    <div key={note}>{note}</div>
+                  ))}
+                </div>
+              </div>
+            </AlertDescription>
+          </Alert>
+        )}
 
         {selectedPlatform && (
           <div className="bg-muted/20 p-4 border rounded-lg overflow-auto max-h-[50vh]">

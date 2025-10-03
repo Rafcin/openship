@@ -645,9 +645,9 @@ async function oAuthFunction({
   if (!platform.appKey) {
     throw new Error("OpenFront OAuth requires appKey in platform configuration");
   }
-  const scopes5 = "read_products,write_products,read_orders,write_orders,read_fulfillments,write_fulfillments,read_webhooks,write_webhooks";
+  const scopes7 = "read_products,write_products,read_orders,write_orders,read_fulfillments,write_fulfillments,read_webhooks,write_webhooks";
   const state = platform.state || Math.random().toString(36).substring(7);
-  const openFrontAuthUrl = `${platform.domain}/dashboard/platform/apps?install=true&client_id=${platform.appKey}&scope=${encodeURIComponent(scopes5)}&redirect_uri=${encodeURIComponent(callbackUrl)}&state=${state}&response_type=code`;
+  const openFrontAuthUrl = `${platform.domain}/dashboard/platform/apps?install=true&client_id=${platform.appKey}&scope=${encodeURIComponent(scopes7)}&redirect_uri=${encodeURIComponent(callbackUrl)}&state=${state}&response_type=code`;
   return { authUrl: openFrontAuthUrl };
 }
 async function oAuthCallbackFunction({
@@ -867,9 +867,210 @@ var init_openfront = __esm({
   }
 });
 
-// features/integrations/channel/shopify.ts
-var shopify_exports = {};
-__export(shopify_exports, {
+// features/integrations/salesforce/common.ts
+function base64UrlEncode(buffer) {
+  return buffer.toString("base64").replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+}
+function base64UrlDecode(value) {
+  try {
+    const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
+    const padding = normalized.length % 4 === 0 ? "" : "=".repeat(4 - normalized.length % 4);
+    return Buffer.from(normalized + padding, "base64").toString("utf8");
+  } catch {
+    return void 0;
+  }
+}
+function createFallbackState() {
+  const nonce = import_crypto.default.randomBytes(16).toString("hex");
+  const payload = JSON.stringify({ nonce });
+  const state = base64UrlEncode(Buffer.from(payload));
+  return { state, nonce };
+}
+function extractStateNonce(state) {
+  if (!state) {
+    return void 0;
+  }
+  const tryParse = (value) => {
+    try {
+      return JSON.parse(value);
+    } catch {
+      return void 0;
+    }
+  };
+  const readNonce = (parsed) => {
+    if (!parsed) return void 0;
+    if (typeof parsed.nonce === "string") {
+      return parsed.nonce;
+    }
+    if (typeof parsed.payload === "string") {
+      const payload = tryParse(parsed.payload);
+      if (payload && typeof payload.nonce === "string") {
+        return payload.nonce;
+      }
+    }
+    return void 0;
+  };
+  const direct = tryParse(state);
+  const nonceFromDirect = readNonce(direct);
+  if (nonceFromDirect) {
+    return nonceFromDirect;
+  }
+  try {
+    const decoded = base64UrlDecode(state);
+    if (decoded) {
+      const parsed = tryParse(decoded);
+      return readNonce(parsed);
+    }
+  } catch {
+    return void 0;
+  }
+  return void 0;
+}
+function resolveStateForPkce(state) {
+  if (!state) {
+    return createFallbackState();
+  }
+  const nonce = extractStateNonce(state);
+  if (nonce) {
+    return { state, nonce };
+  }
+  return { state };
+}
+function buildSalesforceAuthorizeUrl({
+  loginUrl,
+  clientId,
+  callbackUrl,
+  scope,
+  state,
+  codeChallenge
+}) {
+  const url = new URL("/services/oauth2/authorize", loginUrl);
+  url.searchParams.set("response_type", "code");
+  url.searchParams.set("client_id", clientId);
+  url.searchParams.set("redirect_uri", callbackUrl);
+  url.searchParams.set("scope", scope);
+  url.searchParams.set("state", state);
+  if (codeChallenge) {
+    url.searchParams.set("code_challenge", codeChallenge);
+    url.searchParams.set("code_challenge_method", "S256");
+  }
+  return url.toString();
+}
+function resolveSalesforceUrl(domain) {
+  if (!domain) {
+    return DEFAULT_LOGIN_DOMAIN;
+  }
+  if (domain.startsWith("http://") || domain.startsWith("https://")) {
+    return domain.replace(/\/$/, "");
+  }
+  return `https://${domain.replace(/\/$/, "")}`;
+}
+function getSalesforceCredentials(platform, appKeyOverride, appSecretOverride) {
+  const clientId = appKeyOverride || platform.appKey || process.env.SALESFORCE_APP_KEY;
+  const clientSecret = appSecretOverride || platform.appSecret || process.env.SALESFORCE_APP_SECRET;
+  if (!clientId) {
+    throw new Error("Salesforce platform requires an app key in configuration or SALESFORCE_APP_KEY env var");
+  }
+  if (!clientSecret) {
+    throw new Error("Salesforce platform requires an app secret in configuration or SALESFORCE_APP_SECRET env var");
+  }
+  return { clientId, clientSecret };
+}
+async function withSalesforceConnection(options, action) {
+  const { platform, appKeyOverride, appSecretOverride, redirectUri, onTokenRefresh } = options;
+  const { clientId, clientSecret } = getSalesforceCredentials(platform, appKeyOverride, appSecretOverride);
+  const loginUrl = resolveSalesforceUrl(platform.metadata?.loginUrl) || resolveSalesforceUrl(platform.domain);
+  const instanceUrl = platform.instanceUrl ? resolveSalesforceUrl(platform.instanceUrl) : resolveSalesforceUrl(platform.domain);
+  const oauth2 = new import_jsforce.OAuth2({
+    loginUrl,
+    clientId,
+    clientSecret,
+    redirectUri
+  });
+  const connection = new import_jsforce.Connection({
+    oauth2,
+    instanceUrl,
+    accessToken: platform.accessToken,
+    refreshToken: platform.refreshToken
+  });
+  connection.on("refresh", async (accessToken, res) => {
+    try {
+      await onTokenRefresh?.({
+        accessToken,
+        refreshToken: res?.refresh_token || platform.refreshToken,
+        instanceUrl: res?.instance_url || connection.instanceUrl
+      });
+    } catch (error) {
+      console.warn("Salesforce token refresh handler failed", error);
+    }
+  });
+  await ensureValidAccessToken(connection, platform);
+  return action(connection);
+}
+async function ensureValidAccessToken(connection, platform) {
+  if (!platform.refreshToken) {
+    return;
+  }
+  const expiresAt = platform.tokenExpiresAt ? new Date(platform.tokenExpiresAt).getTime() : void 0;
+  const shouldRefresh = !platform.accessToken || typeof expiresAt === "number" && expiresAt - Date.now() <= TOKEN_EXPIRY_BUFFER_MS;
+  if (!shouldRefresh) {
+    return;
+  }
+  try {
+    const tokenResponse = await connection.oauth2.refreshToken(platform.refreshToken);
+    connection.accessToken = tokenResponse.access_token;
+    connection.refreshToken = tokenResponse.refresh_token || platform.refreshToken;
+    if (tokenResponse.instance_url) {
+      connection.instanceUrl = tokenResponse.instance_url;
+    }
+  } catch (error) {
+    console.error("Failed to refresh Salesforce access token", error);
+    throw new Error("Salesforce access token refresh failed");
+  }
+}
+function escapeSoqlLike(term) {
+  return term.replace(/[\\'_%]/g, (char) => `\\${char}`);
+}
+function buildLike(term) {
+  return `%${escapeSoqlLike(term)}%`;
+}
+function mapQueryPageInfo(response) {
+  return {
+    hasNextPage: Boolean(response.nextRecordsUrl),
+    endCursor: response.nextRecordsUrl || null
+  };
+}
+function resolveProductImageUrl(platform, imagePath) {
+  if (!imagePath) {
+    return null;
+  }
+  const base = resolveSalesforceUrl(platform.domain);
+  return `${base}${imagePath.startsWith("/") ? "" : "/"}${imagePath}`;
+}
+var import_jsforce, import_crypto, PKCE_STORE_TTL_MS, globalForPkce, pkceStore, pkceAliases, DEFAULT_LOGIN_DOMAIN, TOKEN_EXPIRY_BUFFER_MS, SALESFORCE_SCOPE, SALESFORCE_DEFAULT_SCOPES;
+var init_common = __esm({
+  "features/integrations/salesforce/common.ts"() {
+    "use strict";
+    import_jsforce = require("jsforce");
+    import_crypto = __toESM(require("crypto"));
+    PKCE_STORE_TTL_MS = 5 * 60 * 1e3;
+    globalForPkce = globalThis;
+    pkceStore = globalForPkce.pkceStore ?? /* @__PURE__ */ new Map();
+    pkceAliases = globalForPkce.pkceAliases ?? /* @__PURE__ */ new Map();
+    if (process.env.NODE_ENV !== "production") {
+      globalForPkce.pkceStore = pkceStore;
+      globalForPkce.pkceAliases = pkceAliases;
+    }
+    DEFAULT_LOGIN_DOMAIN = "https://login.salesforce.com";
+    TOKEN_EXPIRY_BUFFER_MS = 60 * 1e3;
+    SALESFORCE_SCOPE = "api refresh_token";
+    SALESFORCE_DEFAULT_SCOPES = SALESFORCE_SCOPE;
+  }
+});
+
+// features/integrations/channel/salesforce.ts
+var salesforce_exports = {};
+__export(salesforce_exports, {
   cancelPurchaseWebhookHandler: () => cancelPurchaseWebhookHandler,
   createPurchaseFunction: () => createPurchaseFunction2,
   createTrackingWebhookHandler: () => createTrackingWebhookHandler2,
@@ -882,7 +1083,299 @@ __export(shopify_exports, {
   scopes: () => scopes2,
   searchProductsFunction: () => searchProductsFunction2
 });
-async function searchProductsFunction2({
+function scopes2() {
+  return CHANNEL_SCOPES;
+}
+async function ensurePricebookEntry(connection, pricebookId, productId, price) {
+  const result = await connection.query(
+    `SELECT Id FROM PricebookEntry WHERE Pricebook2Id = '${pricebookId}' AND Product2Id = '${productId}' LIMIT 1`
+  );
+  if (result.records.length) {
+    if (typeof price === "number") {
+      await connection.sobject("PricebookEntry").update({ Id: result.records[0].Id, UnitPrice: price });
+    }
+    return result.records[0].Id;
+  }
+  const createResult = await connection.sobject("PricebookEntry").create({
+    Pricebook2Id: pricebookId,
+    Product2Id: productId,
+    UnitPrice: typeof price === "number" ? price : 0,
+    UseStandardPrice: typeof price === "number" ? false : true,
+    IsActive: true
+  });
+  if (!createResult.success) {
+    throw new Error(`Failed to prepare pricebook entry for product ${productId}`);
+  }
+  return createResult.id;
+}
+async function resolveFulfillmentPricebook(connection, platform) {
+  if (platform.pricebookId) {
+    return platform.pricebookId;
+  }
+  const result = await connection.query("SELECT Id FROM Pricebook2 WHERE IsStandard = true LIMIT 1");
+  if (!result.records.length) {
+    throw new Error("Salesforce requires a pricebook to create purchases");
+  }
+  return result.records[0].Id;
+}
+async function searchProductsFunction2({ platform, searchEntry, after }) {
+  return withSalesforceConnection({ platform }, async (connection) => {
+    const soql = `SELECT Id, Name, ProductCode, Description, Family, IsActive,
+      (SELECT Id, UnitPrice, CurrencyIsoCode FROM PricebookEntries WHERE IsActive = true ORDER BY CreatedDate DESC LIMIT 1)
+      FROM Product2
+      WHERE Name LIKE '${buildLike(searchEntry)}' OR ProductCode LIKE '${buildLike(searchEntry)}'
+      ORDER BY LastModifiedDate DESC LIMIT 50`;
+    const result = after ? await connection.queryMore(after) : await connection.query(soql);
+    const records = result.records || [];
+    const products = records.map((record) => {
+      const priceEntry = (record.PricebookEntries?.records || record.PricebookEntries || [])[0];
+      return {
+        title: record.Name,
+        productId: record.Id,
+        variantId: record.ProductCode || record.Id,
+        price: priceEntry?.UnitPrice ?? null,
+        availableForSale: Boolean(record.IsActive),
+        inventory: null,
+        inventoryTracked: true,
+        productLink: `${resolveSalesforceUrl(platform.domain)}/lightning/r/Product2/${record.Id}/view`,
+        cursor: record.Id
+      };
+    });
+    return {
+      products,
+      pageInfo: mapQueryPageInfo(result)
+    };
+  });
+}
+async function getProductFunction2({ platform, productId }) {
+  return withSalesforceConnection({ platform }, async (connection) => {
+    const soql = `SELECT Id, Name, ProductCode, Description, Family,
+      (SELECT Id, UnitPrice FROM PricebookEntries WHERE IsActive = true ORDER BY CreatedDate DESC LIMIT 1)
+      FROM Product2 WHERE Id = '${productId}' LIMIT 1`;
+    const result = await connection.query(soql);
+    if (!result.records.length) {
+      throw new Error(`Salesforce product ${productId} not found`);
+    }
+    const record = result.records[0];
+    const priceEntry = (record.PricebookEntries?.records || record.PricebookEntries || [])[0];
+    return {
+      productId: record.Id,
+      variantId: record.ProductCode || record.Id,
+      title: record.Name,
+      description: record.Description,
+      price: priceEntry?.UnitPrice ?? null,
+      availableForSale: Boolean(record.IsActive),
+      productLink: `${resolveSalesforceUrl(platform.domain)}/lightning/r/Product2/${record.Id}/view`
+    };
+  });
+}
+async function createPurchaseFunction2({ platform, cartItems, shipping, notes }) {
+  return withSalesforceConnection({ platform }, async (connection) => {
+    const accountId = platform.fulfillmentAccountId || platform.metadata?.accountId;
+    if (!accountId) {
+      throw new Error("Salesforce channel platform requires a fulfillment accountId in configuration metadata");
+    }
+    const pricebookId = await resolveFulfillmentPricebook(connection, platform);
+    const orderCreate = await connection.sobject("Order").create({
+      AccountId: accountId,
+      Status: "Draft",
+      EffectiveDate: (/* @__PURE__ */ new Date()).toISOString().split("T")[0],
+      Description: notes,
+      Pricebook2Id: pricebookId,
+      ShippingStreet: shipping?.address1,
+      ShippingCity: shipping?.city,
+      ShippingState: shipping?.province,
+      ShippingPostalCode: shipping?.zip,
+      ShippingCountry: shipping?.country,
+      CustomerAuthorizedById: platform.metadata?.authorizedContactId
+    });
+    if (!orderCreate.success) {
+      throw new Error("Failed to create Salesforce order for purchase");
+    }
+    const orderId = orderCreate.id;
+    for (const item of cartItems) {
+      const numericPrice = typeof item.price === "string" ? parseFloat(item.price) : item.price;
+      const pricebookEntryId = await ensurePricebookEntry(connection, pricebookId, item.productId, Number.isFinite(numericPrice) ? Number(numericPrice) : void 0);
+      await connection.sobject("OrderItem").create({
+        OrderId: orderId,
+        PricebookEntryId: pricebookEntryId,
+        Quantity: item.quantity,
+        UnitPrice: Number.isFinite(numericPrice) ? Number(numericPrice) : void 0,
+        Description: item.name
+      });
+    }
+    return {
+      purchaseId: orderId,
+      url: `${resolveSalesforceUrl(platform.domain)}/lightning/r/Order/${orderId}/view`
+    };
+  });
+}
+async function createWebhookFunction2({ platform, endpoint, events }) {
+  return withSalesforceConnection({ platform }, async (connection) => {
+    const notifyOnCreate = events.includes("FULFILLMENT_CREATED") || events.includes("ORDER_CREATED");
+    const notifyOnUpdate = events.includes("TRACKING_CREATED") || events.includes("FULFILLMENT_UPDATED");
+    const notifyOnDelete = events.includes("ORDER_CANCELLED");
+    const name = `${PUSH_TOPIC_PREFIX}${Date.now()}`.slice(0, 80);
+    const createResult = await connection.sobject("PushTopic").create({
+      Name: name,
+      Query: "SELECT Id, Status, TotalAmount FROM Order",
+      ApiVersion: API_VERSION,
+      NotifyForFields: "Referenced",
+      NotifyForOperationCreate: notifyOnCreate,
+      NotifyForOperationUpdate: notifyOnUpdate,
+      NotifyForOperationDelete: notifyOnDelete,
+      NotifyForOperationUndelete: false
+    });
+    if (!createResult.success) {
+      throw new Error("Failed to create Salesforce channel webhook");
+    }
+    return {
+      webhookId: createResult.id,
+      webhooks: [
+        {
+          id: createResult.id,
+          name,
+          endpoint,
+          events
+        }
+      ]
+    };
+  });
+}
+async function deleteWebhookFunction2({ platform, webhookId }) {
+  return withSalesforceConnection({ platform }, async (connection) => {
+    await connection.sobject("PushTopic").destroy(webhookId);
+    return { success: true };
+  });
+}
+async function getWebhooksFunction2({ platform }) {
+  return withSalesforceConnection({ platform }, async (connection) => {
+    const result = await connection.query(
+      `SELECT Id, Name, Query, ApiVersion FROM PushTopic WHERE Name LIKE '${PUSH_TOPIC_PREFIX}%'`
+    );
+    return result.records.map((record) => ({
+      id: record.Id,
+      name: record.Name,
+      query: record.Query,
+      apiVersion: record.ApiVersion
+    }));
+  });
+}
+async function oAuthFunction2({ platform, callbackUrl }) {
+  const loginUrl = resolveSalesforceUrl(platform.metadata?.loginUrl || platform.domain || process.env.SALESFORCE_LOGIN_URL);
+  const clientId = platform.appKey || process.env.SALESFORCE_APP_KEY;
+  if (!clientId) {
+    throw new Error("Salesforce OAuth requires appKey in platform configuration or SALESFORCE_APP_KEY env var");
+  }
+  const { state } = resolveStateForPkce(platform.state);
+  const authUrl = buildSalesforceAuthorizeUrl({
+    loginUrl,
+    clientId,
+    callbackUrl,
+    scope: `${SALESFORCE_DEFAULT_SCOPES} refresh_token`,
+    state
+  });
+  return { authUrl, state };
+}
+async function oAuthCallbackFunction2({ platform, code, state: _state, appKey, appSecret, redirectUri }) {
+  if (!code) {
+    throw new Error("Salesforce OAuth callback requires authorization code");
+  }
+  const loginUrl = resolveSalesforceUrl(platform.metadata?.loginUrl || platform.domain || process.env.SALESFORCE_LOGIN_URL);
+  const clientId = appKey || platform.appKey || process.env.SALESFORCE_APP_KEY;
+  const clientSecret = appSecret || platform.appSecret || process.env.SALESFORCE_APP_SECRET;
+  if (!clientId || !clientSecret) {
+    throw new Error("Salesforce OAuth callback requires appKey/appSecret in configuration or environment");
+  }
+  const oauth2 = new import_jsforce2.OAuth2({
+    loginUrl,
+    clientId,
+    clientSecret,
+    redirectUri
+  });
+  const connection = new import_jsforce2.Connection({ oauth2 });
+  await connection.authorize(code);
+  let userInfo;
+  try {
+    userInfo = await connection.identity();
+  } catch (error) {
+    console.warn("Salesforce identity lookup failed", error instanceof Error ? error.message : error);
+    userInfo = {
+      id: "unknown",
+      organizationId: "unknown",
+      issued_at: (/* @__PURE__ */ new Date()).toISOString()
+    };
+  }
+  return {
+    accessToken: connection.accessToken,
+    refreshToken: connection.refreshToken,
+    domain: connection.instanceUrl || loginUrl,
+    instanceUrl: connection.instanceUrl,
+    userId: userInfo.id,
+    organizationId: userInfo.organizationId,
+    issuedAt: userInfo.issued_at
+  };
+}
+async function createTrackingWebhookHandler2({ event }) {
+  const payload = event?.sobject || event;
+  if (!payload?.Id) {
+    throw new Error("Salesforce tracking webhook payload missing order data");
+  }
+  const trackingNumber = payload.TrackingNumber__c || payload.TrackingId__c || payload.TrackingNumber;
+  const carrier = payload.TrackingCarrier__c || payload.Carrier__c || payload.Carrier;
+  return {
+    orderId: payload.Id,
+    status: payload.Status,
+    tracking: {
+      number: trackingNumber,
+      carrier,
+      updatedAt: (/* @__PURE__ */ new Date()).toISOString()
+    }
+  };
+}
+async function cancelPurchaseWebhookHandler({ event }) {
+  const payload = event?.sobject || event;
+  if (!payload?.Id) {
+    throw new Error("Salesforce cancel webhook payload missing order data");
+  }
+  return {
+    order: {
+      id: payload.Id,
+      name: payload.OrderNumber,
+      cancelReason: payload.CancelledReason || "unspecified",
+      cancelledAt: (/* @__PURE__ */ new Date()).toISOString()
+    },
+    type: "order_cancelled"
+  };
+}
+var import_jsforce2, PUSH_TOPIC_PREFIX, API_VERSION, CHANNEL_SCOPES;
+var init_salesforce = __esm({
+  "features/integrations/channel/salesforce.ts"() {
+    "use strict";
+    import_jsforce2 = require("jsforce");
+    init_common();
+    PUSH_TOPIC_PREFIX = "Openship_Fulfillment_";
+    API_VERSION = "60.0";
+    CHANNEL_SCOPES = `${SALESFORCE_DEFAULT_SCOPES} refresh_token`;
+  }
+});
+
+// features/integrations/channel/shopify.ts
+var shopify_exports = {};
+__export(shopify_exports, {
+  cancelPurchaseWebhookHandler: () => cancelPurchaseWebhookHandler2,
+  createPurchaseFunction: () => createPurchaseFunction3,
+  createTrackingWebhookHandler: () => createTrackingWebhookHandler3,
+  createWebhookFunction: () => createWebhookFunction3,
+  deleteWebhookFunction: () => deleteWebhookFunction3,
+  getProductFunction: () => getProductFunction3,
+  getWebhooksFunction: () => getWebhooksFunction3,
+  oAuthCallbackFunction: () => oAuthCallbackFunction3,
+  oAuthFunction: () => oAuthFunction3,
+  scopes: () => scopes3,
+  searchProductsFunction: () => searchProductsFunction3
+});
+async function searchProductsFunction3({
   platform,
   searchEntry,
   after
@@ -956,7 +1449,7 @@ async function searchProductsFunction2({
     pageInfo: productVariants.pageInfo
   };
 }
-async function getProductFunction2({
+async function getProductFunction3({
   platform,
   productId,
   variantId
@@ -1020,7 +1513,7 @@ async function getProductFunction2({
   };
   return { product };
 }
-async function createPurchaseFunction2({
+async function createPurchaseFunction3({
   platform,
   cartItems,
   shipping,
@@ -1157,7 +1650,7 @@ async function createPurchaseFunction2({
     status: "pending"
   };
 }
-async function createWebhookFunction2({
+async function createWebhookFunction3({
   platform,
   endpoint,
   events
@@ -1209,7 +1702,7 @@ async function createWebhookFunction2({
   }
   return { webhooks };
 }
-async function deleteWebhookFunction2({
+async function deleteWebhookFunction3({
   platform,
   webhookId
 }) {
@@ -1237,7 +1730,7 @@ async function deleteWebhookFunction2({
   });
   return result.webhookSubscriptionDelete;
 }
-async function getWebhooksFunction2({
+async function getWebhooksFunction3({
   platform
 }) {
   const mapTopic = {
@@ -1285,7 +1778,7 @@ async function getWebhooksFunction2({
   }));
   return { webhooks };
 }
-async function oAuthFunction2({
+async function oAuthFunction3({
   platform,
   callbackUrl
 }) {
@@ -1293,11 +1786,11 @@ async function oAuthFunction2({
   if (!clientId) {
     throw new Error("Shopify OAuth requires appKey in platform config or SHOPIFY_APP_KEY environment variable");
   }
-  const scopes5 = "read_products,write_products,read_orders,write_orders,read_inventory,write_inventory";
-  const shopifyAuthUrl = `https://${platform.domain}/admin/oauth/authorize?client_id=${clientId}&scope=${scopes5}&redirect_uri=${callbackUrl}&state=${Math.random().toString(36).substring(7)}`;
+  const scopes7 = "read_products,write_products,read_orders,write_orders,read_inventory,write_inventory";
+  const shopifyAuthUrl = `https://${platform.domain}/admin/oauth/authorize?client_id=${clientId}&scope=${scopes7}&redirect_uri=${callbackUrl}&state=${Math.random().toString(36).substring(7)}`;
   return { authUrl: shopifyAuthUrl };
 }
-async function oAuthCallbackFunction2({
+async function oAuthCallbackFunction3({
   platform,
   code,
   shop,
@@ -1327,7 +1820,7 @@ async function oAuthCallbackFunction2({
     domain: shop
   };
 }
-async function createTrackingWebhookHandler2({
+async function createTrackingWebhookHandler3({
   platform,
   event,
   headers
@@ -1357,7 +1850,7 @@ async function createTrackingWebhookHandler2({
   };
   return { fulfillment, type: "fulfillment_created" };
 }
-async function cancelPurchaseWebhookHandler({
+async function cancelPurchaseWebhookHandler2({
   platform,
   event,
   headers
@@ -1375,7 +1868,7 @@ async function cancelPurchaseWebhookHandler({
   };
   return { order, type: "purchase_cancelled" };
 }
-function scopes2() {
+function scopes3() {
   return REQUIRED_SCOPES2;
 }
 var import_graphql_request2, REQUIRED_SCOPES2;
@@ -1394,6 +1887,7 @@ var init_ = __esm({
     globImport_ts = __glob({
       "../lib/executor.ts": () => Promise.resolve().then(() => (init_executor(), executor_exports)),
       "../openfront.ts": () => Promise.resolve().then(() => (init_openfront(), openfront_exports)),
+      "../salesforce.ts": () => Promise.resolve().then(() => (init_salesforce(), salesforce_exports)),
       "../shopify.ts": () => Promise.resolve().then(() => (init_shopify(), shopify_exports))
     });
   }
@@ -1525,18 +2019,18 @@ __export(openfront_exports2, {
   addTrackingFunction: () => addTrackingFunction2,
   cancelOrderWebhookHandler: () => cancelOrderWebhookHandler,
   createOrderWebhookHandler: () => createOrderWebhookHandler,
-  createWebhookFunction: () => createWebhookFunction3,
-  deleteWebhookFunction: () => deleteWebhookFunction3,
-  getProductFunction: () => getProductFunction3,
-  getWebhooksFunction: () => getWebhooksFunction3,
-  oAuthCallbackFunction: () => oAuthCallbackFunction3,
-  oAuthFunction: () => oAuthFunction3,
-  scopes: () => scopes3,
+  createWebhookFunction: () => createWebhookFunction4,
+  deleteWebhookFunction: () => deleteWebhookFunction4,
+  getProductFunction: () => getProductFunction4,
+  getWebhooksFunction: () => getWebhooksFunction4,
+  oAuthCallbackFunction: () => oAuthCallbackFunction4,
+  oAuthFunction: () => oAuthFunction4,
+  scopes: () => scopes4,
   searchOrdersFunction: () => searchOrdersFunction,
-  searchProductsFunction: () => searchProductsFunction3,
+  searchProductsFunction: () => searchProductsFunction4,
   updateProductFunction: () => updateProductFunction
 });
-async function searchProductsFunction3({
+async function searchProductsFunction4({
   platform,
   searchEntry,
   after
@@ -1635,7 +2129,7 @@ async function searchProductsFunction3({
     }
   };
 }
-async function getProductFunction3({
+async function getProductFunction4({
   platform,
   productId,
   variantId
@@ -1903,7 +2397,7 @@ async function updateProductFunction({
   const results = await Promise.all(mutations);
   return { success: true, results };
 }
-async function createWebhookFunction3({
+async function createWebhookFunction4({
   platform,
   endpoint,
   events
@@ -1939,7 +2433,7 @@ async function createWebhookFunction3({
     webhookId: webhook.id
   };
 }
-async function deleteWebhookFunction3({
+async function deleteWebhookFunction4({
   platform,
   webhookId
 }) {
@@ -1956,7 +2450,7 @@ async function deleteWebhookFunction3({
   });
   return result;
 }
-async function getWebhooksFunction3({
+async function getWebhooksFunction4({
   platform
 }) {
   const openFrontClient = await createOpenFrontClient2(platform);
@@ -1987,19 +2481,19 @@ async function getWebhooksFunction3({
   }));
   return { webhooks };
 }
-async function oAuthFunction3({
+async function oAuthFunction4({
   platform,
   callbackUrl
 }) {
   if (!platform.appKey) {
     throw new Error("OpenFront OAuth requires appKey in platform configuration");
   }
-  const scopes5 = "read_products,write_products,read_orders,write_orders,read_customers,write_customers,read_webhooks,write_webhooks";
+  const scopes7 = "read_products,write_products,read_orders,write_orders,read_customers,write_customers,read_webhooks,write_webhooks";
   const state = platform.state || Math.random().toString(36).substring(7);
-  const openFrontAuthUrl = `${platform.domain}/dashboard/platform/apps?install=true&client_id=${platform.appKey}&scope=${encodeURIComponent(scopes5)}&redirect_uri=${encodeURIComponent(callbackUrl)}&state=${state}&response_type=code`;
+  const openFrontAuthUrl = `${platform.domain}/dashboard/platform/apps?install=true&client_id=${platform.appKey}&scope=${encodeURIComponent(scopes7)}&redirect_uri=${encodeURIComponent(callbackUrl)}&state=${state}&response_type=code`;
   return { authUrl: openFrontAuthUrl };
 }
-async function oAuthCallbackFunction3({
+async function oAuthCallbackFunction4({
   platform,
   code,
   shop,
@@ -2115,7 +2609,7 @@ async function cancelOrderWebhookHandler({
   };
   return { order, type: "order_cancelled" };
 }
-function scopes3() {
+function scopes4() {
   return REQUIRED_SCOPES3;
 }
 async function addTrackingFunction2({
@@ -2298,24 +2792,392 @@ var init_openfront2 = __esm({
   }
 });
 
-// features/integrations/shop/shopify.ts
-var shopify_exports2 = {};
-__export(shopify_exports2, {
+// features/integrations/shop/salesforce.ts
+var salesforce_exports2 = {};
+__export(salesforce_exports2, {
   addTrackingFunction: () => addTrackingFunction3,
   cancelOrderWebhookHandler: () => cancelOrderWebhookHandler2,
   createOrderWebhookHandler: () => createOrderWebhookHandler2,
-  createWebhookFunction: () => createWebhookFunction4,
-  deleteWebhookFunction: () => deleteWebhookFunction4,
-  getProductFunction: () => getProductFunction4,
-  getWebhooksFunction: () => getWebhooksFunction4,
-  oAuthCallbackFunction: () => oAuthCallbackFunction4,
-  oAuthFunction: () => oAuthFunction4,
-  scopes: () => scopes4,
+  createWebhookFunction: () => createWebhookFunction5,
+  deleteWebhookFunction: () => deleteWebhookFunction5,
+  getProductFunction: () => getProductFunction5,
+  getWebhooksFunction: () => getWebhooksFunction5,
+  oAuthCallbackFunction: () => oAuthCallbackFunction5,
+  oAuthFunction: () => oAuthFunction5,
+  scopes: () => scopes5,
   searchOrdersFunction: () => searchOrdersFunction2,
-  searchProductsFunction: () => searchProductsFunction4,
+  searchProductsFunction: () => searchProductsFunction5,
   updateProductFunction: () => updateProductFunction2
 });
-async function searchProductsFunction4({
+function scopes5() {
+  return SHOP_SCOPES;
+}
+async function getStandardPricebookId(connection) {
+  const result = await connection.query("SELECT Id FROM Pricebook2 WHERE IsStandard = true LIMIT 1");
+  if (!result.records.length) {
+    throw new Error("Salesforce requires a standard pricebook; none found");
+  }
+  return result.records[0].Id;
+}
+async function ensurePricebookEntry2(connection, pricebookId, productId, unitPrice) {
+  const existing = await connection.query(
+    `SELECT Id FROM PricebookEntry WHERE Pricebook2Id = '${pricebookId}' AND Product2Id = '${productId}' LIMIT 1`
+  );
+  if (existing.records.length) {
+    if (typeof unitPrice === "number") {
+      await connection.sobject("PricebookEntry").update({ Id: existing.records[0].Id, UnitPrice: unitPrice });
+    }
+    return existing.records[0].Id;
+  }
+  const price = typeof unitPrice === "number" ? unitPrice : 0;
+  const createResult = await connection.sobject("PricebookEntry").create({
+    Pricebook2Id: pricebookId,
+    Product2Id: productId,
+    UnitPrice: price,
+    UseStandardPrice: typeof unitPrice === "number" ? false : true,
+    IsActive: true
+  });
+  if (!createResult.success) {
+    throw new Error(`Failed to ensure pricebook entry for product ${productId}`);
+  }
+  return createResult.id;
+}
+async function searchProductsFunction5({ platform, searchEntry, after }) {
+  return withSalesforceConnection({ platform }, async (connection) => {
+    const soql = `SELECT Id, Name, ProductCode, Description, Family, IsActive, StockKeepingUnit, QuantityUnitOfMeasure,
+      (SELECT Id, UnitPrice, CurrencyIsoCode FROM PricebookEntries WHERE IsActive = true ORDER BY CreatedDate DESC LIMIT 1)
+      FROM Product2
+      WHERE Name LIKE '${buildLike(searchEntry)}' OR ProductCode LIKE '${buildLike(searchEntry)}'
+      ORDER BY LastModifiedDate DESC LIMIT 50`;
+    const result = after ? await connection.queryMore(after) : await connection.query(soql);
+    const records = result.records || [];
+    const products = records.map((record) => {
+      const pricebookEntries = record.PricebookEntries?.records || record.PricebookEntries || [];
+      const priceEntry = pricebookEntries[0];
+      return {
+        image: resolveProductImageUrl(platform, record.ExternalImageURL__c || null),
+        title: record.Name,
+        productId: record.Id,
+        variantId: record.StockKeepingUnit || record.ProductCode || record.Id,
+        price: priceEntry?.UnitPrice ?? null,
+        availableForSale: Boolean(record.IsActive),
+        inventory: record.QuantityOnHand ?? null,
+        inventoryTracked: true,
+        productLink: `${resolveSalesforceUrl(platform.domain)}/lightning/r/Product2/${record.Id}/view`,
+        cursor: record.Id
+      };
+    });
+    return {
+      products,
+      pageInfo: mapQueryPageInfo(result)
+    };
+  });
+}
+async function getProductFunction5({ platform, productId }) {
+  return withSalesforceConnection({ platform }, async (connection) => {
+    const soql = `SELECT Id, Name, ProductCode, Description, Family, IsActive, StockKeepingUnit, QuantityOnHand,
+      QuantityUnitOfMeasure, ExternalImageURL__c,
+      (SELECT Id, UnitPrice, CurrencyIsoCode FROM PricebookEntries WHERE IsActive = true ORDER BY CreatedDate DESC LIMIT 1)
+      FROM Product2 WHERE Id = '${productId}' LIMIT 1`;
+    const result = await connection.query(soql);
+    if (!result.records.length) {
+      throw new Error(`Salesforce product ${productId} not found`);
+    }
+    const record = result.records[0];
+    const priceEntry = (record.PricebookEntries?.records || record.PricebookEntries || [])[0];
+    return {
+      productId: record.Id,
+      variantId: record.StockKeepingUnit || record.ProductCode || record.Id,
+      title: record.Name,
+      description: record.Description,
+      price: priceEntry?.UnitPrice ?? null,
+      availableForSale: Boolean(record.IsActive),
+      inventory: record.QuantityOnHand ?? null,
+      inventoryTracked: true,
+      productLink: `${resolveSalesforceUrl(platform.domain)}/lightning/r/Product2/${record.Id}/view`,
+      image: resolveProductImageUrl(platform, record.ExternalImageURL__c || null)
+    };
+  });
+}
+async function searchOrdersFunction2({ platform, searchEntry, after }) {
+  return withSalesforceConnection({ platform }, async (connection) => {
+    const soql = `SELECT Id, OrderNumber, Status, TotalAmount, EffectiveDate, CreatedDate, LastModifiedDate,
+      AccountId, Account.Name,
+      ShippingStreet, ShippingCity, ShippingState, ShippingPostalCode, ShippingCountry,
+      (SELECT Id, Quantity, UnitPrice, Description, Product2Id, PricebookEntryId FROM OrderItems)
+      FROM Order
+      WHERE OrderNumber LIKE '${buildLike(searchEntry)}' OR Id LIKE '${buildLike(searchEntry)}'
+      ORDER BY LastModifiedDate DESC LIMIT 50`;
+    const result = after ? await connection.queryMore(after) : await connection.query(soql);
+    const records = result.records || [];
+    const orders = records.map((record) => ({
+      id: record.Id,
+      orderName: record.OrderNumber,
+      status: record.Status,
+      totalPrice: record.TotalAmount,
+      createdAt: record.CreatedDate,
+      updatedAt: record.LastModifiedDate,
+      shipping: {
+        address1: record.ShippingStreet,
+        city: record.ShippingCity,
+        province: record.ShippingState,
+        zip: record.ShippingPostalCode,
+        country: record.ShippingCountry
+      },
+      accountId: record.AccountId,
+      accountName: record.Account?.Name,
+      lineItems: (record.OrderItems?.records || record.OrderItems || []).map((item) => ({
+        id: item.Id,
+        quantity: item.Quantity,
+        price: item.UnitPrice,
+        description: item.Description,
+        productId: item.Product2Id,
+        pricebookEntryId: item.PricebookEntryId
+      }))
+    }));
+    return {
+      orders,
+      pageInfo: mapQueryPageInfo(result)
+    };
+  });
+}
+async function updateProductFunction2({ platform, productId, inventory, price }) {
+  return withSalesforceConnection({ platform }, async (connection) => {
+    const updates = [];
+    if (typeof inventory === "number") {
+      const inventoryField = platform.metadata?.inventoryField || "Quantity__c";
+      try {
+        await connection.sobject("Product2").update({ Id: productId, [inventoryField]: inventory });
+        updates.push("inventory");
+      } catch (error) {
+        console.warn(`Salesforce inventory update failed for ${productId}`, error);
+      }
+    }
+    if (typeof price !== "undefined") {
+      const numericPrice = typeof price === "string" ? parseFloat(price) : price;
+      if (Number.isFinite(numericPrice)) {
+        const pricebookId = platform.metadata?.pricebookId || await getStandardPricebookId(connection);
+        await ensurePricebookEntry2(connection, pricebookId, productId, Number(numericPrice));
+        updates.push("price");
+      }
+    }
+    return {
+      success: updates.length > 0,
+      updated: updates
+    };
+  });
+}
+async function createWebhookFunction5({ platform, endpoint, events }) {
+  return withSalesforceConnection({ platform }, async (connection) => {
+    const notifyOnCreate = events.includes("ORDER_CREATED");
+    const notifyOnUpdate = events.includes("ORDER_UPDATED") || events.includes("TRACKING_CREATED");
+    const notifyOnDelete = events.includes("ORDER_CANCELLED");
+    const name = `${PUSH_TOPIC_PREFIX2}${Date.now()}`.slice(0, 80);
+    const createResult = await connection.sobject("PushTopic").create({
+      Name: name,
+      Query: DEFAULT_WEBHOOK_QUERY,
+      ApiVersion: API_VERSION2,
+      NotifyForFields: "Referenced",
+      NotifyForOperationCreate: notifyOnCreate,
+      NotifyForOperationUpdate: notifyOnUpdate,
+      NotifyForOperationDelete: notifyOnDelete,
+      NotifyForOperationUndelete: false
+    });
+    if (!createResult.success) {
+      throw new Error("Failed to create Salesforce PushTopic webhook");
+    }
+    return {
+      webhookId: createResult.id,
+      webhooks: [
+        {
+          id: createResult.id,
+          name,
+          endpoint,
+          events
+        }
+      ]
+    };
+  });
+}
+async function deleteWebhookFunction5({ platform, webhookId }) {
+  return withSalesforceConnection({ platform }, async (connection) => {
+    await connection.sobject("PushTopic").destroy(webhookId);
+    return { success: true };
+  });
+}
+async function getWebhooksFunction5({ platform }) {
+  return withSalesforceConnection({ platform }, async (connection) => {
+    const result = await connection.query(
+      `SELECT Id, Name, Query, ApiVersion, NotifyForFields FROM PushTopic WHERE Name LIKE '${PUSH_TOPIC_PREFIX2}%'`
+    );
+    return result.records.map((record) => ({
+      id: record.Id,
+      name: record.Name,
+      query: record.Query,
+      apiVersion: record.ApiVersion,
+      notifyForFields: record.NotifyForFields
+    }));
+  });
+}
+async function oAuthFunction5({ platform, callbackUrl }) {
+  const loginUrl = resolveSalesforceUrl(platform.metadata?.loginUrl || platform.domain || process.env.SALESFORCE_LOGIN_URL);
+  const clientId = platform.appKey || process.env.SALESFORCE_APP_KEY;
+  if (!clientId) {
+    throw new Error("Salesforce OAuth requires appKey in platform configuration or SALESFORCE_APP_KEY env var");
+  }
+  const { state } = resolveStateForPkce(platform.state);
+  const authUrl = buildSalesforceAuthorizeUrl({
+    loginUrl,
+    clientId,
+    callbackUrl,
+    scope: SHOP_SCOPES,
+    state
+  });
+  return { authUrl, state };
+}
+async function oAuthCallbackFunction5({ platform, code, state: _state, appKey, appSecret, redirectUri }) {
+  if (!code) {
+    throw new Error("Salesforce OAuth callback requires authorization code");
+  }
+  const loginUrl = resolveSalesforceUrl(platform.metadata?.loginUrl || platform.domain || process.env.SALESFORCE_LOGIN_URL);
+  const { clientId, clientSecret } = (() => {
+    const fallbackKey = appKey || platform.appKey || process.env.SALESFORCE_APP_KEY;
+    const fallbackSecret = appSecret || platform.appSecret || process.env.SALESFORCE_APP_SECRET;
+    if (!fallbackKey || !fallbackSecret) {
+      throw new Error("Salesforce OAuth callback requires appKey/appSecret in platform configuration or environment");
+    }
+    return { clientId: fallbackKey, clientSecret: fallbackSecret };
+  })();
+  const oauth2 = new import_jsforce3.OAuth2({
+    loginUrl,
+    clientId,
+    clientSecret,
+    redirectUri
+  });
+  const connection = new import_jsforce3.Connection({ oauth2 });
+  await connection.authorize(code);
+  let userInfo;
+  try {
+    userInfo = await connection.identity();
+  } catch (error) {
+    console.warn("Salesforce identity lookup failed", error instanceof Error ? error.message : error);
+    userInfo = {
+      id: "unknown",
+      organizationId: "unknown",
+      issued_at: (/* @__PURE__ */ new Date()).toISOString()
+    };
+  }
+  return {
+    accessToken: connection.accessToken,
+    refreshToken: connection.refreshToken,
+    domain: connection.instanceUrl || loginUrl,
+    instanceUrl: connection.instanceUrl,
+    userId: userInfo.id,
+    organizationId: userInfo.organizationId,
+    issuedAt: userInfo.issued_at
+  };
+}
+async function createOrderWebhookHandler2({ platform, event }) {
+  const order = event?.sobject || event?.payload || event;
+  if (!order?.Id) {
+    throw new Error("Salesforce webhook payload missing order data");
+  }
+  const shippingStreet = order.ShippingStreet || order.ShippingAddress?.street;
+  const shippingCity = order.ShippingCity || order.ShippingAddress?.city;
+  const shippingState = order.ShippingState || order.ShippingAddress?.state;
+  const shippingPostalCode = order.ShippingPostalCode || order.ShippingAddress?.postalCode;
+  const shippingCountry = order.ShippingCountry || order.ShippingAddress?.country;
+  const lineItems = (order.OrderItems || order.items || []).map((item) => ({
+    name: item.Description || item.Name,
+    price: item.UnitPrice,
+    quantity: item.Quantity,
+    productId: item.Product2Id,
+    variantId: item.PricebookEntryId,
+    lineItemId: item.Id
+  }));
+  return {
+    orderId: order.Id,
+    orderName: order.OrderNumber,
+    email: order.CustomerAuthorizedById ? void 0 : order.BillToContact?.Email,
+    firstName: order.BillToContact?.FirstName,
+    lastName: order.BillToContact?.LastName,
+    streetAddress1: shippingStreet,
+    city: shippingCity,
+    state: shippingState,
+    zip: shippingPostalCode,
+    country: shippingCountry,
+    phone: order.BillToContact?.Phone,
+    currency: order.CurrencyIsoCode,
+    totalPrice: order.TotalAmount,
+    subTotalPrice: order.SubtotalAmount,
+    totalDiscounts: order.TotalLineItemAmount ? order.TotalLineItemAmount - order.TotalAmount : void 0,
+    totalTax: order.TotalTaxAmount,
+    status: order.Status,
+    linkOrder: true,
+    matchOrder: true,
+    processOrder: true,
+    lineItems: { create: lineItems }
+  };
+}
+async function cancelOrderWebhookHandler2({ event }) {
+  const order = event?.sobject || event;
+  if (!order?.Id) {
+    throw new Error("Salesforce cancel webhook payload missing order data");
+  }
+  return {
+    order: {
+      id: order.Id,
+      name: order.OrderNumber,
+      cancelReason: order.CancelledReason || "unspecified",
+      cancelledAt: (/* @__PURE__ */ new Date()).toISOString()
+    },
+    type: "order_cancelled"
+  };
+}
+async function addTrackingFunction3({ platform, order, trackingCompany, trackingNumber }) {
+  return withSalesforceConnection({ platform }, async (connection) => {
+    const trackingNumberField = platform.metadata?.trackingNumberField || "TrackingNumber__c";
+    const trackingCarrierField = platform.metadata?.trackingCarrierField || "TrackingCarrier__c";
+    const update = {
+      Id: order.orderId,
+      [trackingNumberField]: trackingNumber,
+      [trackingCarrierField]: trackingCompany
+    };
+    await connection.sobject("Order").update(update);
+    return { success: true };
+  });
+}
+var import_jsforce3, DEFAULT_WEBHOOK_QUERY, SHOP_SCOPES, PUSH_TOPIC_PREFIX2, API_VERSION2;
+var init_salesforce2 = __esm({
+  "features/integrations/shop/salesforce.ts"() {
+    "use strict";
+    import_jsforce3 = require("jsforce");
+    init_common();
+    DEFAULT_WEBHOOK_QUERY = "SELECT Id, OrderNumber, Status, TotalAmount, EffectiveDate, LastModifiedDate FROM Order";
+    SHOP_SCOPES = `${SALESFORCE_DEFAULT_SCOPES} refresh_token`;
+    PUSH_TOPIC_PREFIX2 = "Openship_Order_";
+    API_VERSION2 = "60.0";
+  }
+});
+
+// features/integrations/shop/shopify.ts
+var shopify_exports2 = {};
+__export(shopify_exports2, {
+  addTrackingFunction: () => addTrackingFunction4,
+  cancelOrderWebhookHandler: () => cancelOrderWebhookHandler3,
+  createOrderWebhookHandler: () => createOrderWebhookHandler3,
+  createWebhookFunction: () => createWebhookFunction6,
+  deleteWebhookFunction: () => deleteWebhookFunction6,
+  getProductFunction: () => getProductFunction6,
+  getWebhooksFunction: () => getWebhooksFunction6,
+  oAuthCallbackFunction: () => oAuthCallbackFunction6,
+  oAuthFunction: () => oAuthFunction6,
+  scopes: () => scopes6,
+  searchOrdersFunction: () => searchOrdersFunction3,
+  searchProductsFunction: () => searchProductsFunction6,
+  updateProductFunction: () => updateProductFunction3
+});
+async function searchProductsFunction6({
   platform,
   searchEntry,
   after
@@ -2388,7 +3250,7 @@ async function searchProductsFunction4({
     pageInfo: productVariants.pageInfo
   };
 }
-async function getProductFunction4({
+async function getProductFunction6({
   platform,
   productId,
   variantId
@@ -2451,7 +3313,7 @@ async function getProductFunction4({
   };
   return { product };
 }
-async function searchOrdersFunction2({
+async function searchOrdersFunction3({
   platform,
   searchEntry,
   after
@@ -2571,7 +3433,7 @@ async function searchOrdersFunction2({
     pageInfo: orders.pageInfo
   };
 }
-async function updateProductFunction2({
+async function updateProductFunction3({
   platform,
   productId,
   variantId,
@@ -2690,7 +3552,7 @@ async function updateProductFunction2({
   const results = await Promise.all(mutations);
   return { success: true, results };
 }
-async function createWebhookFunction4({
+async function createWebhookFunction6({
   platform,
   endpoint,
   events
@@ -2758,7 +3620,7 @@ async function createWebhookFunction4({
   const webhookId = webhooks[0]?.id?.split("/").pop();
   return { webhooks, webhookId };
 }
-async function deleteWebhookFunction4({
+async function deleteWebhookFunction6({
   platform,
   webhookId
 }) {
@@ -2786,7 +3648,7 @@ async function deleteWebhookFunction4({
   });
   return result.webhookSubscriptionDelete;
 }
-async function getWebhooksFunction4({
+async function getWebhooksFunction6({
   platform
 }) {
   const mapTopic = {
@@ -2834,7 +3696,7 @@ async function getWebhooksFunction4({
   }));
   return { webhooks };
 }
-async function oAuthFunction4({
+async function oAuthFunction6({
   platform,
   callbackUrl
 }) {
@@ -2842,11 +3704,11 @@ async function oAuthFunction4({
   if (!clientId) {
     throw new Error("Shopify OAuth requires appKey in platform config or SHOPIFY_APP_KEY environment variable");
   }
-  const scopes5 = "read_products,write_products,read_orders,write_orders,read_inventory,write_inventory";
-  const shopifyAuthUrl = `https://${platform.domain}/admin/oauth/authorize?client_id=${clientId}&scope=${scopes5}&redirect_uri=${callbackUrl}&state=${Math.random().toString(36).substring(7)}`;
+  const scopes7 = "read_products,write_products,read_orders,write_orders,read_inventory,write_inventory";
+  const shopifyAuthUrl = `https://${platform.domain}/admin/oauth/authorize?client_id=${clientId}&scope=${scopes7}&redirect_uri=${callbackUrl}&state=${Math.random().toString(36).substring(7)}`;
   return { authUrl: shopifyAuthUrl };
 }
-async function oAuthCallbackFunction4({
+async function oAuthCallbackFunction6({
   platform,
   code,
   shop,
@@ -2876,7 +3738,7 @@ async function oAuthCallbackFunction4({
     domain: shop
   };
 }
-async function createOrderWebhookHandler2({
+async function createOrderWebhookHandler3({
   platform,
   event,
   headers
@@ -2959,7 +3821,7 @@ async function createOrderWebhookHandler2({
     lineItems: { create: lineItemsOutput }
   };
 }
-async function addTrackingFunction3({
+async function addTrackingFunction4({
   order,
   trackingCompany,
   trackingNumber
@@ -3069,7 +3931,7 @@ async function addTrackingFunction3({
   });
   return createResponseBody;
 }
-async function cancelOrderWebhookHandler2({
+async function cancelOrderWebhookHandler3({
   platform,
   event,
   headers
@@ -3086,7 +3948,7 @@ async function cancelOrderWebhookHandler2({
   };
   return { order, type: "order_cancelled" };
 }
-function scopes4() {
+function scopes6() {
   return REQUIRED_SCOPES4;
 }
 var import_graphql_request4, import_getBaseUrl2, REQUIRED_SCOPES4;
@@ -3106,6 +3968,7 @@ var init_2 = __esm({
     globImport_ts2 = __glob({
       "../lib/executor.ts": () => Promise.resolve().then(() => (init_executor2(), executor_exports2)),
       "../openfront.ts": () => Promise.resolve().then(() => (init_openfront2(), openfront_exports2)),
+      "../salesforce.ts": () => Promise.resolve().then(() => (init_salesforce2(), salesforce_exports2)),
       "../shopify.ts": () => Promise.resolve().then(() => (init_shopify2(), shopify_exports2))
     });
   }
@@ -3304,9 +4167,9 @@ var SCOPE_TO_PERMISSIONS = {
   "read_users": ["canSeeOtherUsers"],
   "write_users": ["canSeeOtherUsers", "canEditOtherUsers", "canManageUsers", "canManageRoles"]
 };
-function getPermissionsForApiKeyScopes(scopes5) {
+function getPermissionsForApiKeyScopes(scopes7) {
   const permissions6 = /* @__PURE__ */ new Set();
-  scopes5.forEach((scope) => {
+  scopes7.forEach((scope) => {
     const scopePermissions = SCOPE_TO_PERMISSIONS[scope];
     if (scopePermissions) {
       scopePermissions.forEach((permission) => permissions6.add(permission));
@@ -3314,13 +4177,13 @@ function getPermissionsForApiKeyScopes(scopes5) {
   });
   return Array.from(permissions6);
 }
-function hasApiKeyPermission(scopes5, permission) {
-  return getPermissionsForApiKeyScopes(scopes5).includes(permission);
+function hasApiKeyPermission(scopes7, permission) {
+  return getPermissionsForApiKeyScopes(scopes7).includes(permission);
 }
 function checkApiKeyPermission(session, permission) {
   if (!session?.apiKeyScopes) return false;
-  const scopes5 = session.apiKeyScopes;
-  return hasApiKeyPermission(scopes5, permission);
+  const scopes7 = session.apiKeyScopes;
+  return hasApiKeyPermission(scopes7, permission);
 }
 
 // features/keystone/access.ts
@@ -3912,6 +4775,7 @@ var import_fields7 = require("@keystone-6/core/fields");
 var globImport_integrations_channel_ts = __glob({
   "../../integrations/channel/lib/executor.ts": () => Promise.resolve().then(() => (init_executor(), executor_exports)),
   "../../integrations/channel/openfront.ts": () => Promise.resolve().then(() => (init_openfront(), openfront_exports)),
+  "../../integrations/channel/salesforce.ts": () => Promise.resolve().then(() => (init_salesforce(), salesforce_exports)),
   "../../integrations/channel/shopify.ts": () => Promise.resolve().then(() => (init_shopify(), shopify_exports))
 });
 
@@ -4015,6 +4879,7 @@ async function getChannelWebhooks2({ platform }) {
 var globImport_integrations_shop_ts = __glob({
   "../../integrations/shop/lib/executor.ts": () => Promise.resolve().then(() => (init_executor2(), executor_exports2)),
   "../../integrations/shop/openfront.ts": () => Promise.resolve().then(() => (init_openfront2(), openfront_exports2)),
+  "../../integrations/shop/salesforce.ts": () => Promise.resolve().then(() => (init_salesforce2(), salesforce_exports2)),
   "../../integrations/shop/shopify.ts": () => Promise.resolve().then(() => (init_shopify2(), shopify_exports2))
 });
 
@@ -5357,7 +6222,7 @@ async function getMatch(root, { input }, context) {
         channelId,
         ...rest
       } of existingMatch.output) {
-        const { searchProductsFunction: searchProductsFunction5 } = channel.platform;
+        const { searchProductsFunction: searchProductsFunction7 } = channel.platform;
         const searchResult = await searchChannelProducts2({
           platform: channel.platform,
           searchEntry: productId,

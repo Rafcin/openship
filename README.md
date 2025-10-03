@@ -101,6 +101,19 @@ openship/
    - Run database migrations
    - Start Next.js development server with Turbopack
 
+### Run with Docker
+
+The repository includes a Docker setup that provisions both the app (using Bun) and a Postgres database.
+
+1. Ensure Docker Desktop (or another Docker runtime) is running.
+2. Build and start the stack:
+   ```bash
+   docker compose up --build
+   ```
+3. Visit [http://localhost:3000](http://localhost:3000) once the containers report as ready.
+
+The Bun container installs dependencies on startup and then executes `bun dev`, so code or dependency changes are picked up automatically. Modify environment variables in `docker-compose.yml` (e.g. `SESSION_SECRET`, `DATABASE_URL`) or create a `.env` file that Docker Compose can load if you prefer to keep secrets out of version control.
+
 4. **Access the application:**
    - **Dashboard**: [http://localhost:3000](http://localhost:3000) - Order routing interface
    - **GraphQL API**: [http://localhost:3000/api/graphql](http://localhost:3000/api/graphql) - Interactive API explorer

@@ -302,6 +302,7 @@ export async function GET(request: NextRequest) {
       redirectUrl.searchParams.set('showCreateShop', 'true');
       redirectUrl.searchParams.set('platform', platformId);
       redirectUrl.searchParams.set('accessToken', accessToken);
+      let redirectDomain = shop ?? '';
       if (typeof tokenResult === 'object') {
         // Include additional token data for new implementations
         if (tokenResult.refreshToken) {
@@ -310,8 +311,17 @@ export async function GET(request: NextRequest) {
         if (tokenResult.tokenExpiresAt) {
           redirectUrl.searchParams.set('tokenExpiresAt', tokenResult.tokenExpiresAt);
         }
+        if (!redirectDomain && tokenResult.domain) {
+          redirectDomain = tokenResult.domain;
+        }
+        if (tokenResult.instanceUrl) {
+          redirectUrl.searchParams.set('instanceUrl', tokenResult.instanceUrl);
+        }
       }
-      redirectUrl.searchParams.set('domain', shop ?? '');
+      if (!redirectDomain) {
+        redirectDomain = platform?.domain || '';
+      }
+      redirectUrl.searchParams.set('domain', redirectDomain);
       
       return NextResponse.redirect(redirectUrl.toString());
       
@@ -356,6 +366,7 @@ export async function GET(request: NextRequest) {
       redirectUrl.searchParams.set('showCreateChannel', 'true');
       redirectUrl.searchParams.set('platform', platformId);
       redirectUrl.searchParams.set('accessToken', accessToken);
+      let channelRedirectDomain = shop ?? '';
       if (typeof channelTokenResult === 'object') {
         // Include additional token data for new implementations
         if (channelTokenResult.refreshToken) {
@@ -364,8 +375,17 @@ export async function GET(request: NextRequest) {
         if (channelTokenResult.tokenExpiresAt) {
           redirectUrl.searchParams.set('tokenExpiresAt', channelTokenResult.tokenExpiresAt);
         }
+        if (!channelRedirectDomain && channelTokenResult.domain) {
+          channelRedirectDomain = channelTokenResult.domain;
+        }
+        if (channelTokenResult.instanceUrl) {
+          redirectUrl.searchParams.set('instanceUrl', channelTokenResult.instanceUrl);
+        }
       }
-      redirectUrl.searchParams.set('domain', shop ?? '');
+      if (!channelRedirectDomain) {
+        channelRedirectDomain = platform?.domain || '';
+      }
+      redirectUrl.searchParams.set('domain', channelRedirectDomain);
       
       return NextResponse.redirect(redirectUrl.toString());
       
@@ -387,4 +407,3 @@ export async function GET(request: NextRequest) {
     );
   }
 }
-

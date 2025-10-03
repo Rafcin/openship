@@ -40,7 +40,10 @@
       "Bash(git stash:*)",
       "Bash(git clone:*)",
       "Bash(npm run dev:*)",
-      "Bash(pkill:*)"
+      "Bash(pkill:*)",
+      "Bash(bun pm ls:*)",
+      "Bash(cat:*)",
+      "Bash(bun add:*)"
     ],
     "deny": [],
     "additionalDirectories": [
